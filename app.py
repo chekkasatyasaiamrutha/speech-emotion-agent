@@ -9,11 +9,9 @@ app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Load the trained model
 with open("emotion_model.pkl", "rb") as f:
     model = pickle.load(f)
 
-# Helper function to generate agent responses based on emotion
 def get_agent_response(emotion):
     responses = {
         'neutral': "You seem perfectly calm and steady. Let me know how I can assist you today!",
@@ -27,25 +25,35 @@ def get_agent_response(emotion):
     }
     return responses.get(emotion, "I processed your audio, but couldn't quite map the exact feeling.")
 
+# ⭐ OPTIMIZED MEMORY-EFFICIENT FEATURE EXTRACTION
 def extract_feature(file_path):
-    with sf.SoundFile(file_path) as sound_file:
-        X = sound_file.read(dtype="float32")
-        sample_rate = sound_file.samplerate
-        if len(X.shape) > 1:
-            X = np.mean(X, axis=1) # Convert Stereo to Mono
-            
-        result = np.array([])
-        # MFCC
-        mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=40).T, axis=0)
-        result = np.hstack((result, mfccs))
-        # Chroma
-        stft = np.abs(librosa.stft(X))
-        chroma_feat = np.mean(librosa.feature.chroma_stft(S=stft, sr=sample_rate).T, axis=0)
-        result = np.hstack((result, chroma_feat))
-        # Mel Spectrogram
-        mel_feat = np.mean(librosa.feature.melspectrogram(y=X, sr=sample_rate).T, axis=0)
-        result = np.hstack((result, mel_feat))
+    # Read with soundfile natively using a targeted sample rate limit
+    X, sample_rate = sf.read(file_path, dtype="float32")
+    
+    if len(X.shape) > 1:
+        X = np.mean(X, axis=1) # Stereo to Mono
         
+    # Downsample if the file rate is unnecessarily high (e.g. 44.1kHz down to 16kHz) 
+    # This prevents RAM spikes on the free tier hosting environment
+    if sample_rate > 16000:
+        X = librosa.resample(X, orig_sr=sample_rate, target_sr=16000)
+        sample_rate = 16000
+
+    result = np.array([])
+    
+    # 1. MFCC
+    mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=40).T, axis=0)
+    result = np.hstack((result, mfccs))
+    
+    # 2. Chroma (Optimized STFT hop length to conserve memory)
+    stft = np.abs(librosa.stft(X, hop_length=512))
+    chroma_feat = np.mean(librosa.feature.chroma_stft(S=stft, sr=sample_rate).T, axis=0)
+    result = np.hstack((result, chroma_feat))
+    
+    # 3. Mel Spectrogram
+    mel_feat = np.mean(librosa.feature.melspectrogram(y=X, sr=sample_rate).T, axis=0)
+    result = np.hstack((result, mel_feat))
+    
     return result.reshape(1, -1)
 
 @app.route('/')
@@ -66,14 +74,11 @@ def predict():
         file.save(file_path)
         
         try:
-            # Extract features and predict
             features = extract_feature(file_path)
             prediction = model.predict(features)[0]
             agent_text = get_agent_response(prediction)
             
-            # Clean up the uploaded file after processing
             os.remove(file_path)
-            
             return jsonify({
                 'status': 'success',
                 'emotion': prediction.capitalize(),
